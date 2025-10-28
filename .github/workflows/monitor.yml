@@ -49,6 +49,8 @@ jobs:
       - name: Run monitor
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          RANCH_COOKIE_HEADER: ${{ secrets.RANCH_COOKIE_HEADER }}
+          RANCH_AUTH_TOKEN: ${{ secrets.RANCH_AUTH_TOKEN }}
           DISCORD_TEST: ${{ github.event.inputs.test }}
           POST_ALL: ${{ github.event.inputs.dump_all }}
           DEBUG: "true"
