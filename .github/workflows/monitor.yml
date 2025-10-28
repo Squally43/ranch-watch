@@ -39,20 +39,12 @@ jobs:
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         run: |
-          python - << 'PY'
-import os, json, urllib.request
-u = os.environ.get("DISCORD_WEBHOOK","").strip()
-print("Testing webhook URL prefix:", (u[:45] + "...") if u else "(empty)")
-if not u:
-    raise SystemExit("❌ DISCORD_WEBHOOK is not set or empty.")
-url = u + ("?wait=true" if "?wait=" not in u else "")
-payload = {"content": "✅ Webhook sanity ping from GitHub Actions"}
-req = urllib.request.Request(url,
-    data=json.dumps(payload).encode("utf-8"),
-    headers={"Content-Type":"application/json","User-Agent":"ranch-watch-bot/1.0"})
-with urllib.request.urlopen(req, timeout=20) as r:
-    print("✅ Discord responded:", r.status)
-PY
+          set -e
+          echo "Pinging: ${DISCORD_WEBHOOK}"
+          curl -sS -X POST -H "Content-Type: application/json" \
+            -d '{"content":"✅ Webhook sanity ping from GitHub Actions"}' \
+            "${DISCORD_WEBHOOK}?wait=true"
+          echo "✅ Discord webhook responded."
 
       - name: Run monitor
         env:
