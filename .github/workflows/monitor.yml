@@ -29,7 +29,35 @@ jobs:
         run: |
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
+      - name: Sanity check webhook (only on test runs)
+        if: ${{ github.event.inputs.test == 'true' }}
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          python - << 'PY'
+import os, json, urllib.request
 
+u = os.environ["DISCORD_WEBHOOK"].strip()
+print(f"Testing webhook URL begins with: {u[:40]}...")
+
+if not u:
+    raise SystemExit("❌ DISCORD_WEBHOOK is not set or empty.")
+
+url = u + ("?wait=true" if "?wait=" not in u else "")
+headers = {
+    "Content-Type": "application/json",
+    "User-Agent": "ranch-watch-bot/1.0"
+}
+data = json.dumps({"content": "✅ Webhook sanity ping from GitHub Actions"}).encode("utf-8")
+req = urllib.request.Request(url, data=data, headers=headers)
+
+try:
+    with urllib.request.urlopen(req, timeout=20) as r:
+        print("✅ Discord responded with status:", r.status)
+except Exception as e:
+    print("❌ Webhook failed:", e)
+    raise
+PY
       - name: Run monitor
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
