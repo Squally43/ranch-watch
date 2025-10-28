@@ -1,108 +1,279 @@
 import asyncio, json, os, re, sys
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import List, Tuple
 from urllib.parse import urljoin
+from typing import Dict, List, Tuple
 
 from playwright.async_api import async_playwright
-import urllib.request
-import urllib.error
+import urllib.request, urllib.error
 
-BUSINESSES_URL = "https://ranchroleplay.com/businesses"
-PROPERTIES_URL = "https://ranchroleplay.com/properties"
+# ---------------- Config ----------------
+ROOT = "https://ranchroleplay.com"
+BUSINESSES_URL = f"{ROOT}/businesses"
+PROPERTIES_URL  = f"{ROOT}/properties"
+
 STATE_DIR = Path("state")
 STATE_DIR.mkdir(exist_ok=True)
+
+# ENV controls (set via GitHub Actions inputs or local env)
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "").strip()
+DISCORD_TEST    = (os.getenv("DISCORD_TEST", "false").lower() == "true")
+POST_ALL        = (os.getenv("POST_ALL", "false").lower() == "true")
 
-def load_seen(name: str) -> set:
-    p = STATE_DIR / f"{name}.json"
+# How many absent runs before we say "OFF MARKET"
+ABSENCE_THRESHOLD = 1  # alert as soon as it disappears once; raise to 2 if you want to be safer
+
+# ------------- Helpers: state I/O -------------
+def _state_path(name: str) -> Path:
+    return STATE_DIR / f"{name}.json"
+
+def load_map(name: str) -> Dict[str, dict]:
+    p = _state_path(name)
     if p.exists():
-        return set(json.loads(p.read_text()))
-    return set()
+        return json.loads(p.read_text())
+    return {}
 
-def save_seen(name: str, items: set):
-    (STATE_DIR / f"{name}.json").write_text(json.dumps(sorted(items), indent=2))
+def save_map(name: str, data: Dict[str, dict]):
+    _state_path(name).write_text(json.dumps(data, indent=2, ensure_ascii=False))
 
-async def extract_slugs(page, base_path: str) -> List[Tuple[str, str]]:
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+# ------------- Discord (embeds) -------------
+def _chunk(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i+n]
+
+def build_embed(title: str, url: str, fields: List[Tuple[str, str]], color: int = 0x2b6cb0):
+    # Max 25 fields per embed; we’ll keep it small (<=6)
+    embed = {
+        "title": title[:256],
+        "url": url,
+        "color": color,
+        "timestamp": utc_now_iso(),
+        "fields": [{"name": k[:256], "value": (v or "-")[:1024], "inline": True} for k, v in fields][:10]
+    }
+    return embed
+
+def post_discord(content: str = "", embeds: List[dict] = None):
+    if not DISCORD_WEBHOOK:
+        print("[warn] No DISCORD_WEBHOOK set; printing:")
+        print(content)
+        if embeds:
+            print(json.dumps(embeds, indent=2))
+        return
+    payload = {"content": content}
+    if embeds:
+        payload["embeds"] = embeds
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(DISCORD_WEBHOOK, data=data, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=25) as resp:
+        print("[ok] Discord notified:", resp.status)
+
+def post_discord_batched(title_prefix: str, items: List[dict], batch_size=10):
+    # Discord allows up to 10 embeds per message
+    for i, batch in enumerate(_chunk(items, batch_size), start=1):
+        content = f"**{title_prefix}** (batch {i})" if len(items) > batch_size else f"**{title_prefix}**"
+        post_discord(content=content, embeds=batch)
+
+# ------------- Scraping -------------
+PRICE_RE  = re.compile(r"\$\s*([0-9][\d,]*)", re.I)
+BID_RE    = re.compile(r"(?:current\s*)?bid[:\s]*\$\s*([0-9][\d,]*)", re.I)
+STATUS_RE = re.compile(r"(for sale|on the market|sold|pending|closed|reserved|taken|leased|rented)", re.I)
+
+async def get_page_items(page, base_path: str) -> Dict[str, dict]:
     """
-    Heuristics:
-    - Gather all anchors with href containing the base path (e.g., '/business' or '/properties')
-    - Normalize to unique list of (slug, absolute_url)
-    - If the app loads via XHR/fetch to an API, this still works because the DOM will contain links/cards.
+    Extract items by enumerating anchors with href like '/businesses/<slug>' or '/properties/<slug>'
+    Then, pull details (title/price/bid/status) from the closest visible container text.
     """
     await page.wait_for_load_state("networkidle")
-    # Give client time to render after data load
     await page.wait_for_timeout(2000)
 
     anchors = await page.locator('a[href]').all()
-    items = []
+    found: Dict[str, dict] = {}
     for a in anchors:
         href = await a.get_attribute("href")
-        txt = (await a.inner_text()).strip() if await a.is_visible() else ""
         if not href:
             continue
-        # Match either '/businesses/<slug>' or '/properties/<slug>'
-        if re.search(rf"^{base_path}/[^/#?]+$", href):
+        if re.search(rf"^{base_path}/[^/#?]+$", href) or (
+            base_path == "/businesses" and re.search(r"^/business/[^/#?]+$", href)
+        ):
             slug = href.rstrip("/").split("/")[-1]
-            abs_url = href if href.startswith("http") else urljoin("https://ranchroleplay.com", href)
-            items.append((slug, abs_url))
-        # Some SPAs use '/business/<slug>' singular — catch that too:
-        elif base_path == "/businesses" and re.search(r"^/business/[^/#?]+$", href):
-            slug = href.rstrip("/").split("/")[-1]
-            abs_url = urljoin("https://ranchroleplay.com", href)
-            items.append((slug, abs_url))
-    # Deduplicate by slug
-    unique = {}
-    for slug, u in items:
-        unique.setdefault(slug, u)
-    return [(k, v) for k, v in unique.items()]
+            abs_url = href if href.startswith("http") else urljoin(ROOT, href)
 
-async def check_page(browser, url: str, state_name: str, base_path: str) -> List[str]:
+            # Try to gather a nice title and details from the closest card/container
+            # 1) title: link text or slug
+            title = (await a.inner_text()).strip()
+            if not title:
+                title = slug.replace("-", " ").title()
+
+            # 2) Discover container text to mine price/bid/status
+            container_text = await a.evaluate("""
+                el => {
+                  let c = el.closest('article, .card, .item, li, .container, .block, .tile')
+                       || el.parentElement;
+                  return (c && c.innerText) ? c.innerText : el.innerText || '';
+                }
+            """)
+            t = container_text or ""
+
+            # Parse price and bids/status with regex
+            price = None
+            bid = None
+            status = None
+
+            m_price = PRICE_RE.search(t)
+            if m_price: price = m_price.group(1).replace(",", "")
+
+            m_bid = BID_RE.search(t)
+            if m_bid: bid = m_bid.group(1).replace(",", "")
+
+            m_status = STATUS_RE.search(t)
+            if m_status: status = m_status.group(1).title()
+
+            found[slug] = {
+                "slug": slug,
+                "url": abs_url,
+                "title": title,
+                "price": int(price) if price else None,
+                "current_bid": int(bid) if bid else None,
+                "status": status,                  # e.g., "For Sale", "Sold"
+                "last_seen": utc_now_iso(),
+                "absence": 0,                      # counter for “off market” detection
+            }
+    return found
+
+async def scrape(browser, url: str, state_name: str, base_path: str):
     page = await browser.new_page()
     await page.goto(url, wait_until="domcontentloaded")
-    slugs = await extract_slugs(page, base_path)
+    items = await get_page_items(page, base_path)
     await page.close()
 
-    current = set([s for s, _ in slugs])
-    seen = load_seen(state_name)
+    prev = load_map(state_name)  # map: slug -> data
+    now  = items
 
-    new = sorted(current - seen)
-    if new:
-        save_seen(state_name, seen.union(current))
-        # Build pretty lines with URLs
-        lookup = {s: u for s, u in slugs}
-        lines = [f"- **{s}** → {lookup.get(s, '')}" for s in new]
-        await notify_discord(
-            title=f"New {state_name.capitalize()} detected",
-            lines=lines
-        )
-    return new
+    new_items, bid_ups, disappeared = [], [], []
 
-async def notify_discord(title: str, lines: List[str]):
-    if not DISCORD_WEBHOOK:
-        print("[warn] No DISCORD_WEBHOOK set; printing instead:")
-        print(title)
-        print("\n".join(lines))
-        return
-    content = f"**{title}**\n" + "\n".join(lines) + f"\n\n_UTC: {datetime.now(timezone.utc).isoformat(timespec='seconds')}_"
-    data = json.dumps({"content": content}).encode("utf-8")
-    req = urllib.request.Request(DISCORD_WEBHOOK, data=data, headers={"Content-Type":"application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            print("[ok] Discord notified:", resp.status)
-    except urllib.error.HTTPError as e:
-        print("[err] Discord HTTPError:", e.read().decode("utf-8"), file=sys.stderr)
-    except Exception as e:
-        print("[err] Discord error:", e, file=sys.stderr)
+    # Compare current vs previous
+    for slug, info in now.items():
+        if slug not in prev:
+            new_items.append(info)
+        else:
+            # bid increase?
+            before = prev[slug]
+            b_prev = before.get("current_bid")
+            b_now  = info.get("current_bid")
+            if b_now is not None and b_prev is not None and b_now > b_prev:
+                bid_ups.append((before, info))
 
+            # carry absence forward (we saw it this run)
+            info["absence"] = 0
+
+    # Detect disappeared (potentially off market)
+    for slug, old in prev.items():
+        if slug not in now:
+            # mark absence
+            old_abs = int(old.get("absence", 0)) + 1
+            old["absence"] = old_abs
+            if old_abs >= ABSENCE_THRESHOLD:
+                disappeared.append(old)
+
+    # Merge & persist state
+    merged = {**prev, **now}
+    # ensure we keep increased absence for missing ones
+    for d in disappeared:
+        merged[d["slug"]] = d
+    save_map(state_name, merged)
+
+    return new_items, bid_ups, disappeared, now
+
+# ------------- Reporting -------------
+def embeds_for_new(kind: str, items: List[dict]) -> List[dict]:
+    embeds = []
+    for it in items:
+        fields = [
+            ("Status", it.get("status") or "On the Market"),
+            ("Price", f"${it['price']:,}" if it.get("price") else "—"),
+            ("Current Bid", f"${it['current_bid']:,}" if it.get("current_bid") else "—"),
+        ]
+        embeds.append(build_embed(f"New {kind[:-1].title()}: {it['title']}", it["url"], fields, color=0x22c55e))
+    return embeds
+
+def embeds_for_bidups(kind: str, pairs: List[Tuple[dict, dict]]) -> List[dict]:
+    embeds = []
+    for before, after in pairs:
+        fields = [
+            ("Previous Bid", f"${before['current_bid']:,}" if before.get("current_bid") else "—"),
+            ("New Bid", f"${after['current_bid']:,}" if after.get("current_bid") else "—"),
+            ("Price", f"${after['price']:,}" if after.get("price") else "—"),
+        ]
+        embeds.append(build_embed(f"{kind[:-1].title()} Bid Increased: {after['title']}", after["url"], fields, color=0xf59e0b))
+    return embeds
+
+def embeds_for_offmarket(kind: str, items: List[dict]) -> List[dict]:
+    embeds = []
+    for it in items:
+        fields = [
+            ("Last Known Status", it.get("status") or "Unknown"),
+            ("Last Seen (UTC)", it.get("last_seen") or "—"),
+            ("Last Price", f"${it['price']:,}" if it.get("price") else "—"),
+            ("Last Bid", f"${it['current_bid']:,}" if it.get("current_bid") else "—"),
+        ]
+        embeds.append(build_embed(f"{kind[:-1].title()} Possibly Off Market: {it['title']}", it.get("url") or "", fields, color=0xef4444))
+    return embeds
+
+def embeds_for_dump(kind: str, items_map: Dict[str, dict]) -> List[dict]:
+    embeds = []
+    for slug, it in sorted(items_map.items(), key=lambda kv: kv[1].get("title","").lower()):
+        fields = [
+            ("Status", it.get("status") or "On the Market"),
+            ("Price", f"${it['price']:,}" if it.get("price") else "—"),
+            ("Current Bid", f"${it['current_bid']:,}" if it.get("current_bid") else "—"),
+            ("Slug", slug),
+        ]
+        embeds.append(build_embed(f"{kind[:-1].title()}: {it['title']}", it.get("url") or "", fields, color=0x3b82f6))
+    return embeds
+
+# ------------- Main -------------
 async def main():
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
         try:
-            nb = await check_page(browser, BUSINESSES_URL, "businesses", "/businesses")
-            np = await check_page(browser, PROPERTIES_URL, "properties", "/properties")
-            print(f"New businesses: {nb}")
-            print(f"New properties: {np}")
+            # Optional: test message
+            if DISCORD_TEST:
+                post_discord(content="✅ **Ranch Watch test** — webhook and embeds look good.")
+
+            # Scrape both pages
+            new_biz, bidups_biz, off_biz, biz_now = await scrape(browser, BUSINESSES_URL, "businesses", "/businesses")
+            new_prop, bidups_prop, off_prop, prop_now = await scrape(browser, PROPERTIES_URL,  "properties", "/properties")
+
+            # Post ALL (baseline snapshot)
+            if POST_ALL:
+                post_discord_batched("Businesses — Full Snapshot", embeds_for_dump("businesses", biz_now))
+                post_discord_batched("Properties — Full Snapshot", embeds_for_dump("properties", prop_now))
+
+            # New items
+            if new_biz:
+                post_discord_batched("New Businesses Detected", embeds_for_new("businesses", new_biz))
+            if new_prop:
+                post_discord_batched("New Properties Detected", embeds_for_new("properties", new_prop))
+
+            # Bid increases
+            if bidups_biz:
+                post_discord_batched("Business Bid Increases", embeds_for_bidups("businesses", bidups_biz))
+            if bidups_prop:
+                post_discord_batched("Property Bid Increases", embeds_for_bidups("properties", bidups_prop))
+
+            # Off market
+            if off_biz:
+                post_discord_batched("Businesses Possibly Off Market", embeds_for_offmarket("businesses", off_biz))
+            if off_prop:
+                post_discord_batched("Properties Possibly Off Market", embeds_for_offmarket("properties", off_prop))
+
+            # Console summary
+            print("New businesses:", [i["slug"] for i in new_biz])
+            print("New properties:", [i["slug"] for i in new_prop])
+
         finally:
             await browser.close()
 
