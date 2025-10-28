@@ -11,6 +11,8 @@ import urllib.request, urllib.error
 ROOT = "https://ranchroleplay.com"
 BUSINESSES_URL = f"{ROOT}/businesses"
 PROPERTIES_URL  = f"{ROOT}/properties"
+DEBUG = os.getenv("DEBUG", "false").lower() == "true"
+
 
 STATE_DIR = Path("state")
 STATE_DIR.mkdir(exist_ok=True)
@@ -105,65 +107,84 @@ STATUS_RE = re.compile(r"(for sale|on the market|sold|pending|closed|reserved|ta
 
 async def get_page_items(page, base_path: str) -> Dict[str, dict]:
     """
-    Extract items by enumerating anchors with href like '/businesses/<slug>' or '/properties/<slug>'
-    Then, pull details (title/price/bid/status) from the closest visible container text.
+    Robust extractor:
+    - Waits for network idle + small delays
+    - Scrolls to bottom to trigger lazy loads
+    - Collects ALL anchors and normalizes to absolute URLs
+    - Accepts any path containing '/business' or '/propert'
+    - Uses the final path segment as the slug
     """
     await page.wait_for_load_state("networkidle")
-    await page.wait_for_timeout(2000)
+    await page.wait_for_timeout(1500)
+
+    # try to trigger any lazy content
+    await page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+    await page.wait_for_timeout(800)
+    await page.evaluate("() => window.scrollTo(0, 0)")
+    await page.wait_for_timeout(400)
 
     anchors = await page.locator('a[href]').all()
+    hrefs = []
+    for a in anchors:
+        h = await a.get_attribute("href")
+        if h:
+            # to absolute
+            hrefs.append(urljoin(ROOT, h))
+
+    if DEBUG:
+        print(f"[debug] total anchors found: {len(hrefs)}")
+        susp = [h for h in hrefs if ("/business" in h or "/propert" in h)]
+        print("[debug] sample candidates:", susp[:25])
+
     found: Dict[str, dict] = {}
     for a in anchors:
         href = await a.get_attribute("href")
         if not href:
             continue
-        if re.search(rf"^{base_path}/[^/#?]+$", href) or (
-            base_path == "/businesses" and re.search(r"^/business/[^/#?]+$", href)
-        ):
-            slug = href.rstrip("/").split("/")[-1]
-            abs_url = href if href.startswith("http") else urljoin(ROOT, href)
+        abs_url = urljoin(ROOT, href)
 
-            # Try to gather a nice title and details from the closest card/container
-            # 1) title: link text or slug
-            title = (await a.inner_text()).strip()
-            if not title:
-                title = slug.replace("-", " ").title()
+        # accept both businesses/properties/singular variants/other prefixes
+        if ("/business" in abs_url or "/propert" in abs_url):
+            # get last non-empty path segment as slug
+            path = abs_url.split("://", 1)[-1].split("/", 1)[-1]  # strip scheme/host
+            parts = [p for p in path.split("/") if p and not p.startswith("#")]
+            if len(parts) < 2:  # need at least "businesses" + "slug"
+                continue
+            slug = parts[-1]
+            if not slug or "." in slug or "?" in slug:  # skip files/query-only
+                slug = slug.split("?")[0]
 
-            # 2) Discover container text to mine price/bid/status
+            # title from link text
+            title = (await a.inner_text()).strip() or slug.replace("-", " ").title()
+
+            # inspect nearest card/container for details
             container_text = await a.evaluate("""
                 el => {
-                  let c = el.closest('article, .card, .item, li, .container, .block, .tile')
+                  let c = el.closest('article, .card, .item, li, .container, .block, .tile, .listing, .panel, .box')
                        || el.parentElement;
                   return (c && c.innerText) ? c.innerText : el.innerText || '';
                 }
-            """)
-            t = container_text or ""
-
-            # Parse price and bids/status with regex
-            price = None
-            bid = None
-            status = None
-
-            m_price = PRICE_RE.search(t)
-            if m_price: price = m_price.group(1).replace(",", "")
-
-            m_bid = BID_RE.search(t)
-            if m_bid: bid = m_bid.group(1).replace(",", "")
-
-            m_status = STATUS_RE.search(t)
-            if m_status: status = m_status.group(1).title()
+            """) or ""
+            # parse details
+            price = None; bid = None; status = None
+            m = PRICE_RE.search(container_text);   price = int(m.group(1).replace(",","")) if m else None
+            m = BID_RE.search(container_text);     bid   = int(m.group(1).replace(",","")) if m else None
+            m = STATUS_RE.search(container_text);  status = m.group(1).title() if m else None
 
             found[slug] = {
                 "slug": slug,
                 "url": abs_url,
                 "title": title,
-                "price": int(price) if price else None,
-                "current_bid": int(bid) if bid else None,
-                "status": status,                  # e.g., "For Sale", "Sold"
+                "price": price,
+                "current_bid": bid,
+                "status": status,
                 "last_seen": utc_now_iso(),
-                "absence": 0,                      # counter for “off market” detection
+                "absence": 0,
             }
+    if DEBUG:
+        print(f"[debug] matched items: {len(found)}  (keys: {list(found)[:10]}...)")
     return found
+
 
 async def scrape(browser, url: str, state_name: str, base_path: str):
     page = await browser.new_page()
