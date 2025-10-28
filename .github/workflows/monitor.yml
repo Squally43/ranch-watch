@@ -51,6 +51,7 @@ jobs:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           DISCORD_TEST: ${{ github.event.inputs.test }}
           POST_ALL: ${{ github.event.inputs.dump_all }}
+          DEBUG: "true"
         run: python monitor.py
 
       - name: Commit state updates (if any)
