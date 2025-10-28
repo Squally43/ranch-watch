@@ -21,6 +21,9 @@ STATE_DIR.mkdir(exist_ok=True)
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "").strip()
 DISCORD_TEST    = (os.getenv("DISCORD_TEST", "false").lower() == "true")
 POST_ALL        = (os.getenv("POST_ALL", "false").lower() == "true")
+RANCH_COOKIE_HEADER = os.getenv("RANCH_COOKIE_HEADER", "").strip()
+RANCH_AUTH_TOKEN    = os.getenv("RANCH_AUTH_TOKEN", "").strip()
+
 
 # How many absent runs before we say "OFF MARKET"
 ABSENCE_THRESHOLD = 1  # alert as soon as it disappears once; raise to 2 if you want to be safer
@@ -429,47 +432,110 @@ def embeds_for_dump(kind: str, items_map: Dict[str, dict]) -> List[dict]:
     return embeds
 
 # ------------- Main -------------
+# ------------- Main -------------
 async def main():
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+        # launch browser
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-gpu",
+            ],
+        )
+
+        # create a human-ish context
+        UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        context = await browser.new_context(
+            user_agent=UA,
+            locale="en-GB",
+            timezone_id="Europe/London",
+        )
+
+        # stealth tweaks (helps with bot checks)
+        tmp = await context.new_page()
+        await tmp.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        window.chrome = { runtime: {} };
+        Object.defineProperty(navigator, 'languages', { get: () => ['en-GB','en'] });
+        Object.defineProperty(navigator, 'plugins',   { get: () => [1,2,3,4,5] });
+        """)
+        await tmp.close()
+
+        # inject your real request headers (from GitHub Secrets)
+        extra_headers = {}
+        if RANCH_COOKIE_HEADER:
+            extra_headers["cookie"] = RANCH_COOKIE_HEADER
+        if RANCH_AUTH_TOKEN:
+            extra_headers["authorization"] = f"Bearer {RANCH_AUTH_TOKEN}"
+        if extra_headers:
+            await context.set_extra_http_headers(extra_headers)
+
+        # also set cookie jar entries (helps some SPAs)
+        if RANCH_COOKIE_HEADER:
+            cookie_list = []
+            for part in RANCH_COOKIE_HEADER.split(";"):
+                if "=" in part:
+                    name, value = part.strip().split("=", 1)
+                    cookie_list.append({
+                        "name": name,
+                        "value": value,
+                        "domain": "ranchroleplay.com",
+                        "path": "/",
+                        "secure": True,
+                        "httpOnly": False,
+                    })
+            if cookie_list:
+                await context.add_cookies(cookie_list)
+
         try:
-            # Optional: test message
             if DISCORD_TEST:
                 post_discord(content="✅ **Ranch Watch test** — webhook and embeds look good.")
 
-            # Scrape both pages
-            new_biz, bidups_biz, off_biz, biz_now = await scrape(browser, BUSINESSES_URL, "businesses", "/businesses")
-            new_prop, bidups_prop, off_prop, prop_now = await scrape(browser, PROPERTIES_URL,  "properties", "/properties")
+            # scrape using the CONTEXT (it has your headers/cookies)
+            new_biz,  bidups_biz,  off_biz,  biz_now  = await scrape(context, BUSINESSES_URL, "businesses", "/businesses")
+            new_prop, bidups_prop, off_prop, prop_now = await scrape(context, PROPERTIES_URL,  "properties", "/properties")
 
-            # Post ALL (baseline snapshot)
+            # optional full snapshot
             if POST_ALL:
                 post_discord_batched("Businesses — Full Snapshot", embeds_for_dump("businesses", biz_now))
                 post_discord_batched("Properties — Full Snapshot", embeds_for_dump("properties", prop_now))
 
-            # New items
+            # new items
             if new_biz:
                 post_discord_batched("New Businesses Detected", embeds_for_new("businesses", new_biz))
             if new_prop:
                 post_discord_batched("New Properties Detected", embeds_for_new("properties", new_prop))
 
-            # Bid increases
+            # bid increases
             if bidups_biz:
                 post_discord_batched("Business Bid Increases", embeds_for_bidups("businesses", bidups_biz))
             if bidups_prop:
                 post_discord_batched("Property Bid Increases", embeds_for_bidups("properties", bidups_prop))
 
-            # Off market
+            # possibly off market
             if off_biz:
                 post_discord_batched("Businesses Possibly Off Market", embeds_for_offmarket("businesses", off_biz))
             if off_prop:
                 post_discord_batched("Properties Possibly Off Market", embeds_for_offmarket("properties", off_prop))
 
-            # Console summary
+            # console summary
             print("New businesses:", [i["slug"] for i in new_biz])
             print("New properties:", [i["slug"] for i in new_prop])
 
         finally:
+            await context.close()
             await browser.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
+
+
 
 if __name__ == "__main__":
     asyncio.run(main())
