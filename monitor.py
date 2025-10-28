@@ -105,6 +105,94 @@ PRICE_RE  = re.compile(r"\$\s*([0-9][\d,]*)", re.I)
 BID_RE    = re.compile(r"(?:current\s*)?bid[:\s]*\$\s*([0-9][\d,]*)", re.I)
 STATUS_RE = re.compile(r"(for sale|on the market|sold|pending|closed|reserved|taken|leased|rented)", re.I)
 
+async def collect_from_embedded_json(page, kind_hint: str) -> Dict[str, dict]:
+    """
+    Scrape <script type="application/json"> blocks and window.__NEXT_DATA__/__NUXT__/__APOLLO_STATE__.
+    """
+    found: Dict[str, dict] = {}
+
+    # 1) window globals
+    try:
+        blob = await page.evaluate("() => JSON.stringify(window.__NEXT_DATA__ || window.__NUXT__ || window.__APOLLO_STATE__ || null)")
+        if blob and blob != "null":
+            data = json.loads(blob)
+            if DEBUG:
+                print("[debug] found window JSON global with top-level keys:", list(data.keys())[:12] if isinstance(data, dict) else type(data).__name__)
+            # reuse the walker from above
+            def iter_dict_lists(x):
+                if isinstance(x, list) and x and isinstance(x[0], dict):
+                    yield x
+                if isinstance(x, dict):
+                    for v in x.values():
+                        yield from iter_dict_lists(v)
+            def coerce_item(obj):
+                slug = str(obj.get("slug") or obj.get("id") or obj.get("uid") or "").strip()
+                title = str(obj.get("title") or obj.get("name") or "").strip()
+                url = obj.get("url") or ""
+                if url and not url.startswith("http"):
+                    url = urljoin(ROOT, url)
+                if not slug:
+                    base = title or url or str(obj.get("id") or "")
+                    slug = re.sub(r"[^a-z0-9\-]+", "-", base.lower()).strip("-")[:80]
+                return {
+                    "slug": slug,
+                    "url": url or urljoin(ROOT, ("/businesses/" if "business" in kind_hint else "/properties/") + slug),
+                    "title": title or slug.replace("-", " ").title(),
+                    "price": None, "current_bid": None, "status": None,
+                    "last_seen": utc_now_iso(), "absence": 0,
+                }
+            for arr in iter_dict_lists(data):
+                for obj in arr:
+                    try:
+                        item = coerce_item(obj)
+                        if item["slug"]:
+                            found[item["slug"]] = item
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    # 2) <script type="application/json"> blocks
+    try:
+        handles = await page.locator('script[type="application/json"]').all()
+        for h in handles:
+            try:
+                txt = await h.inner_text()
+                data = json.loads(txt)
+            except Exception:
+                continue
+            # same mining
+            def iter_dict_lists(x):
+                if isinstance(x, list) and x and isinstance(x[0], dict):
+                    yield x
+                if isinstance(x, dict):
+                    for v in x.values():
+                        yield from iter_dict_lists(v)
+            for arr in iter_dict_lists(data):
+                for obj in arr:
+                    try:
+                        slug = str(obj.get("slug") or obj.get("id") or "").strip()
+                        title = str(obj.get("title") or obj.get("name") or "").strip()
+                        if not slug and not title:
+                            continue
+                        if not slug:
+                            slug = re.sub(r"[^a-z0-9\-]+", "-", title.lower()).strip("-")[:80]
+                        found[slug] = {
+                            "slug": slug,
+                            "url": urljoin(ROOT, ("/businesses/" if "business" in kind_hint else "/properties/") + slug),
+                            "title": title or slug.replace("-", " ").title(),
+                            "price": None, "current_bid": None, "status": None,
+                            "last_seen": utc_now_iso(), "absence": 0,
+                        }
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    if DEBUG:
+        print(f"[debug] embedded-json matched items: {len(found)}  (keys: {list(found)[:10]}...)")
+    return found
+
 async def get_page_items(page, base_path: str) -> Dict[str, dict]:
     # Bias for URL matching in network capture
     kind_hint = "business" if "business" in base_path else "propert"
@@ -113,6 +201,10 @@ async def get_page_items(page, base_path: str) -> Dict[str, dict]:
     via_net = await collect_items_via_network(page, kind_hint)
     if via_net:
         return via_net
+
+    via_embed = await collect_from_embedded_json(page, kind_hint)
+    if via_embed:
+        return via_embed
 
     # Fallback: anchor scraping (kept as-is, trimmed)
     await page.wait_for_load_state("networkidle")
@@ -153,21 +245,14 @@ async def get_page_items(page, base_path: str) -> Dict[str, dict]:
     return found
 
 async def collect_items_via_network(page, kind_hint: str) -> Dict[str, dict]:
-    """
-    Observe network responses; collect JSON that looks like business/property listings.
-    kind_hint: 'business' or 'propert' to bias URL matching.
-    """
     collected = []
 
     def looks_relevant(url: str, ctype: str) -> bool:
         if "application/json" not in (ctype or "").lower():
             return False
-        url_l = url.lower()
-        # Heuristics: API endpoints commonly include these
-        return any(s in url_l for s in [
-            kind_hint, "list", "items", "entries", "catalog", "market", "marketplace",
-            "props", "cards", "search", "graphql", "api", "wp-json", "content"
-        ])
+        u = url.lower()
+        # very permissive: anything JSON while we're on this page
+        return True
 
     async def on_response(resp):
         try:
@@ -176,7 +261,7 @@ async def collect_items_via_network(page, kind_hint: str) -> Dict[str, dict]:
             if looks_relevant(url, ctype):
                 try:
                     data = await resp.json()
-                    collected.append((url, data))
+                    collected.append((url, ctype, data))
                 except Exception:
                     pass
         except Exception:
@@ -184,63 +269,61 @@ async def collect_items_via_network(page, kind_hint: str) -> Dict[str, dict]:
 
     page.on("response", on_response)
 
-    # give the SPA time to fetch
     await page.wait_for_load_state("networkidle")
-    await page.wait_for_timeout(2000)
+    await page.wait_for_timeout(1500)
     await page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
     await page.wait_for_timeout(800)
     await page.evaluate("() => window.scrollTo(0, 0)")
     await page.wait_for_timeout(400)
 
-    # Mine the collected JSON blobs for listing-like arrays
-    found: Dict[str, dict] = {}
+    if DEBUG:
+        print(f"[debug] network JSON blobs captured: {len(collected)}")
+        for url, ctype, data in collected:
+            # print top-level keys only (safe)
+            top = list(data.keys())[:12] if isinstance(data, dict) else (f"len={len(data)} list" if isinstance(data, list) else type(data).__name__)
+            print(f"[debug]  - {url}  ({ctype})  top={top}")
+
     def coerce_item(obj):
-        # Try the most common field names
         slug = str(obj.get("slug") or obj.get("id") or obj.get("uid") or obj.get("handle") or "").strip()
-        title = str(obj.get("title") or obj.get("name") or "").strip()
-        price = obj.get("price") or obj.get("amount") or obj.get("askingPrice")
-        bid = obj.get("current_bid") or obj.get("currentBid") or obj.get("highestBid")
+        title = str(obj.get("title") or obj.get("name") or obj.get("label") or "").strip()
+        price = obj.get("price") or obj.get("amount") or obj.get("askingPrice") or obj.get("cost")
+        bid = obj.get("current_bid") or obj.get("currentBid") or obj.get("highestBid") or obj.get("bid")
         status = obj.get("status") or obj.get("state")
-        url = (obj.get("url") or obj.get("permalink") or "")
+        url = (obj.get("url") or obj.get("permalink") or obj.get("href") or "")
         if url and not url.startswith("http"):
             url = urljoin(ROOT, url)
-        # if no slug but we have title or id, fabricate a stable-ish slug
         if not slug:
             base = title or url or str(obj.get("id") or obj.get("uid") or "")
             slug = re.sub(r"[^a-z0-9\-]+", "-", base.lower()).strip("-")[:80]
         if not url:
-            # best guess conventional detail path
-            # kind_hint decides which base to use
             base_path = "/businesses" if "business" in kind_hint else "/properties"
             url = urljoin(ROOT, f"{base_path}/{slug}")
+        def to_int(v):
+            if v is None: return None
+            s = str(v).replace(",", "").strip()
+            return int(s) if s.isdigit() else None
         return {
             "slug": slug,
             "url": url,
             "title": title or slug.replace("-", " ").title(),
-            "price": int(str(price).replace(",", "")) if isinstance(price, (int, float, str)) and str(price).strip().isdigit() else None,
-            "current_bid": int(str(bid).replace(",", "")) if isinstance(bid, (int, float, str)) and str(bid).strip().isdigit() else None,
+            "price": to_int(price),
+            "current_bid": to_int(bid),
             "status": str(status).title() if status else None,
             "last_seen": utc_now_iso(),
             "absence": 0,
         }
 
-    # walk each JSON payload to find arrays of objects
-    def walk(x):
-        if isinstance(x, list):
-            return x
+    # Walk JSON: hunt for arrays of dicts anywhere
+    def iter_dict_lists(x):
+        if isinstance(x, list) and x and isinstance(x[0], dict):
+            yield x
         if isinstance(x, dict):
-            # Many APIs nest under data/items/results/edges/nodes
-            for k in ["items", "results", "data", "entries", "list", "edges", "nodes", "records"]:
-                if k in x and isinstance(x[k], list):
-                    return x[k]
-        return None
+            for v in x.values():
+                yield from iter_dict_lists(v)
 
-    if DEBUG:
-        print(f"[debug] network JSON blobs captured: {len(collected)}")
-
-    for url, data in collected:
-        arr = walk(data)
-        if isinstance(arr, list) and arr and isinstance(arr[0], dict):
+    found: Dict[str, dict] = {}
+    for url, _, data in collected:
+        for arr in iter_dict_lists(data):
             for obj in arr:
                 try:
                     item = coerce_item(obj)
