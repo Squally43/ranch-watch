@@ -106,35 +106,18 @@ BID_RE    = re.compile(r"(?:current\s*)?bid[:\s]*\$\s*([0-9][\d,]*)", re.I)
 STATUS_RE = re.compile(r"(for sale|on the market|sold|pending|closed|reserved|taken|leased|rented)", re.I)
 
 async def get_page_items(page, base_path: str) -> Dict[str, dict]:
-    """
-    Robust extractor:
-    - Waits for network idle + small delays
-    - Scrolls to bottom to trigger lazy loads
-    - Collects ALL anchors and normalizes to absolute URLs
-    - Accepts any path containing '/business' or '/propert'
-    - Uses the final path segment as the slug
-    """
+    # Bias for URL matching in network capture
+    kind_hint = "business" if "business" in base_path else "propert"
+
+    # First, try network JSON capture (works for most SPAs)
+    via_net = await collect_items_via_network(page, kind_hint)
+    if via_net:
+        return via_net
+
+    # Fallback: anchor scraping (kept as-is, trimmed)
     await page.wait_for_load_state("networkidle")
     await page.wait_for_timeout(1500)
-
-    # try to trigger any lazy content
-    await page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
-    await page.wait_for_timeout(800)
-    await page.evaluate("() => window.scrollTo(0, 0)")
-    await page.wait_for_timeout(400)
-
     anchors = await page.locator('a[href]').all()
-    hrefs = []
-    for a in anchors:
-        h = await a.get_attribute("href")
-        if h:
-            # to absolute
-            hrefs.append(urljoin(ROOT, h))
-
-    if DEBUG:
-        print(f"[debug] total anchors found: {len(hrefs)}")
-        susp = [h for h in hrefs if ("/business" in h or "/propert" in h)]
-        print("[debug] sample candidates:", susp[:25])
 
     found: Dict[str, dict] = {}
     for a in anchors:
@@ -142,47 +125,132 @@ async def get_page_items(page, base_path: str) -> Dict[str, dict]:
         if not href:
             continue
         abs_url = urljoin(ROOT, href)
-
-        # accept both businesses/properties/singular variants/other prefixes
         if ("/business" in abs_url or "/propert" in abs_url):
-            # get last non-empty path segment as slug
-            path = abs_url.split("://", 1)[-1].split("/", 1)[-1]  # strip scheme/host
+            path = abs_url.split("://", 1)[-1].split("/", 1)[-1]
             parts = [p for p in path.split("/") if p and not p.startswith("#")]
-            if len(parts) < 2:  # need at least "businesses" + "slug"
+            if len(parts) < 2:
                 continue
-            slug = parts[-1]
-            if not slug or "." in slug or "?" in slug:  # skip files/query-only
-                slug = slug.split("?")[0]
-
-            # title from link text
+            slug = parts[-1].split("?")[0]
             title = (await a.inner_text()).strip() or slug.replace("-", " ").title()
-
-            # inspect nearest card/container for details
-            container_text = await a.evaluate("""
+            t = await a.evaluate("""
                 el => {
                   let c = el.closest('article, .card, .item, li, .container, .block, .tile, .listing, .panel, .box')
                        || el.parentElement;
                   return (c && c.innerText) ? c.innerText : el.innerText || '';
                 }
             """) or ""
-            # parse details
             price = None; bid = None; status = None
-            m = PRICE_RE.search(container_text);   price = int(m.group(1).replace(",","")) if m else None
-            m = BID_RE.search(container_text);     bid   = int(m.group(1).replace(",","")) if m else None
-            m = STATUS_RE.search(container_text);  status = m.group(1).title() if m else None
-
+            m = PRICE_RE.search(t);   price = int(m.group(1).replace(",","")) if m else None
+            m = BID_RE.search(t);     bid   = int(m.group(1).replace(",","")) if m else None
+            m = STATUS_RE.search(t);  status = m.group(1).title() if m else None
             found[slug] = {
-                "slug": slug,
-                "url": abs_url,
-                "title": title,
-                "price": price,
-                "current_bid": bid,
-                "status": status,
-                "last_seen": utc_now_iso(),
-                "absence": 0,
+                "slug": slug, "url": abs_url, "title": title,
+                "price": price, "current_bid": bid, "status": status,
+                "last_seen": utc_now_iso(), "absence": 0
             }
     if DEBUG:
-        print(f"[debug] matched items: {len(found)}  (keys: {list(found)[:10]}...)")
+        print(f"[debug] anchor matched items: {len(found)}  (keys: {list(found)[:10]}...)")
+    return found
+
+async def collect_items_via_network(page, kind_hint: str) -> Dict[str, dict]:
+    """
+    Observe network responses; collect JSON that looks like business/property listings.
+    kind_hint: 'business' or 'propert' to bias URL matching.
+    """
+    collected = []
+
+    def looks_relevant(url: str, ctype: str) -> bool:
+        if "application/json" not in (ctype or "").lower():
+            return False
+        url_l = url.lower()
+        # Heuristics: API endpoints commonly include these
+        return any(s in url_l for s in [
+            kind_hint, "list", "items", "entries", "catalog", "market", "marketplace",
+            "props", "cards", "search", "graphql", "api", "wp-json", "content"
+        ])
+
+    async def on_response(resp):
+        try:
+            ctype = (resp.headers or {}).get("content-type", "")
+            url = resp.url
+            if looks_relevant(url, ctype):
+                try:
+                    data = await resp.json()
+                    collected.append((url, data))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    page.on("response", on_response)
+
+    # give the SPA time to fetch
+    await page.wait_for_load_state("networkidle")
+    await page.wait_for_timeout(2000)
+    await page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+    await page.wait_for_timeout(800)
+    await page.evaluate("() => window.scrollTo(0, 0)")
+    await page.wait_for_timeout(400)
+
+    # Mine the collected JSON blobs for listing-like arrays
+    found: Dict[str, dict] = {}
+    def coerce_item(obj):
+        # Try the most common field names
+        slug = str(obj.get("slug") or obj.get("id") or obj.get("uid") or obj.get("handle") or "").strip()
+        title = str(obj.get("title") or obj.get("name") or "").strip()
+        price = obj.get("price") or obj.get("amount") or obj.get("askingPrice")
+        bid = obj.get("current_bid") or obj.get("currentBid") or obj.get("highestBid")
+        status = obj.get("status") or obj.get("state")
+        url = (obj.get("url") or obj.get("permalink") or "")
+        if url and not url.startswith("http"):
+            url = urljoin(ROOT, url)
+        # if no slug but we have title or id, fabricate a stable-ish slug
+        if not slug:
+            base = title or url or str(obj.get("id") or obj.get("uid") or "")
+            slug = re.sub(r"[^a-z0-9\-]+", "-", base.lower()).strip("-")[:80]
+        if not url:
+            # best guess conventional detail path
+            # kind_hint decides which base to use
+            base_path = "/businesses" if "business" in kind_hint else "/properties"
+            url = urljoin(ROOT, f"{base_path}/{slug}")
+        return {
+            "slug": slug,
+            "url": url,
+            "title": title or slug.replace("-", " ").title(),
+            "price": int(str(price).replace(",", "")) if isinstance(price, (int, float, str)) and str(price).strip().isdigit() else None,
+            "current_bid": int(str(bid).replace(",", "")) if isinstance(bid, (int, float, str)) and str(bid).strip().isdigit() else None,
+            "status": str(status).title() if status else None,
+            "last_seen": utc_now_iso(),
+            "absence": 0,
+        }
+
+    # walk each JSON payload to find arrays of objects
+    def walk(x):
+        if isinstance(x, list):
+            return x
+        if isinstance(x, dict):
+            # Many APIs nest under data/items/results/edges/nodes
+            for k in ["items", "results", "data", "entries", "list", "edges", "nodes", "records"]:
+                if k in x and isinstance(x[k], list):
+                    return x[k]
+        return None
+
+    if DEBUG:
+        print(f"[debug] network JSON blobs captured: {len(collected)}")
+
+    for url, data in collected:
+        arr = walk(data)
+        if isinstance(arr, list) and arr and isinstance(arr[0], dict):
+            for obj in arr:
+                try:
+                    item = coerce_item(obj)
+                    if item["slug"]:
+                        found[item["slug"]] = item
+                except Exception:
+                    continue
+
+    if DEBUG:
+        print(f"[debug] network matched items: {len(found)}  (keys: {list(found)[:10]}...)")
     return found
 
 
