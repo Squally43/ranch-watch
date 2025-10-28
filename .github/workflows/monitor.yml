@@ -1,15 +1,16 @@
 name: Ranch Watch
+
 on:
   schedule:
-    - cron: "0 */2 * * *"   # every 2 hours
+    - cron: "0 */2 * * *"   # every 2 hours UTC
   workflow_dispatch:
     inputs:
       test:
-        description: "Send a test message"
+        description: "Send a test ping to Discord"
         required: false
         default: "false"
       dump_all:
-        description: "Post a full snapshot of current businesses and properties"
+        description: "Post a full snapshot of all current listings"
         required: false
         default: "false"
 
@@ -19,9 +20,11 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -29,6 +32,8 @@ jobs:
         run: |
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
+
+      # --- Sanity check the Discord webhook when test=true ---
       - name: Sanity check webhook (only on test runs)
         if: ${{ github.event.inputs.test == 'true' }}
         env:
@@ -36,28 +41,19 @@ jobs:
         run: |
           python - << 'PY'
 import os, json, urllib.request
-
-u = os.environ["DISCORD_WEBHOOK"].strip()
-print(f"Testing webhook URL begins with: {u[:40]}...")
-
+u = os.environ.get("DISCORD_WEBHOOK","").strip()
+print("Testing webhook URL prefix:", (u[:45] + "...") if u else "(empty)")
 if not u:
     raise SystemExit("❌ DISCORD_WEBHOOK is not set or empty.")
-
 url = u + ("?wait=true" if "?wait=" not in u else "")
-headers = {
-    "Content-Type": "application/json",
-    "User-Agent": "ranch-watch-bot/1.0"
-}
-data = json.dumps({"content": "✅ Webhook sanity ping from GitHub Actions"}).encode("utf-8")
-req = urllib.request.Request(url, data=data, headers=headers)
-
-try:
-    with urllib.request.urlopen(req, timeout=20) as r:
-        print("✅ Discord responded with status:", r.status)
-except Exception as e:
-    print("❌ Webhook failed:", e)
-    raise
+payload = {"content": "✅ Webhook sanity ping from GitHub Actions"}
+req = urllib.request.Request(url,
+    data=json.dumps(payload).encode("utf-8"),
+    headers={"Content-Type":"application/json","User-Agent":"ranch-watch-bot/1.0"})
+with urllib.request.urlopen(req, timeout=20) as r:
+    print("✅ Discord responded:", r.status)
 PY
+
       - name: Run monitor
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
@@ -69,7 +65,6 @@ PY
         run: |
           git config user.name "ranch-bot"
           git config user.email "ranch-bot@users.noreply.github.com"
-          git add state/*.json
+          git add state/*.json || true
           git diff --cached --quiet || git commit -m "Update seen items $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          git push
-
+          git diff --cached --quiet || git push
