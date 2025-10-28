@@ -56,19 +56,41 @@ def build_embed(title: str, url: str, fields: List[Tuple[str, str]], color: int 
     return embed
 
 def post_discord(content: str = "", embeds: List[dict] = None):
+    """
+    Send to Discord using curl (same path as the sanity step) to avoid urllib quirks.
+    """
     if not DISCORD_WEBHOOK:
-        print("[warn] No DISCORD_WEBHOOK set; printing:")
+        print("[warn] No DISCORD_WEBHOOK set; printing only.")
         print(content)
         if embeds:
             print(json.dumps(embeds, indent=2))
         return
+
+    url = DISCORD_WEBHOOK
+    if "?wait=" not in url:
+        url += "?wait=true"
+
     payload = {"content": content}
     if embeds:
         payload["embeds"] = embeds
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(DISCORD_WEBHOOK, data=data, headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=25) as resp:
-        print("[ok] Discord notified:", resp.status)
+
+    import subprocess, shlex
+    data = json.dumps(payload)
+
+    cmd = f'curl -sS -X POST -H "Content-Type: application/json" -d {shlex.quote(data)} "{url}"'
+    print("[debug] posting via curl…")
+    res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+
+    if res.returncode != 0:
+        print("[err] curl failed:", res.stderr.strip())
+        raise RuntimeError(f"Discord post failed (curl exit {res.returncode})")
+
+    # When wait=true Discord returns JSON; if empty, it's fine too.
+    if res.stdout:
+        print("[ok] Discord responded with body:", res.stdout[:2000])
+    else:
+        print("[ok] Discord responded (no body).")
+
 
 def post_discord_batched(title_prefix: str, items: List[dict], batch_size=10):
     # Discord allows up to 10 embeds per message
